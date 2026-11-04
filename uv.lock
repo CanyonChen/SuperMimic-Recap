@@ -921,8 +921,7 @@ dependencies = [
     { name = "tyro" },
     { name = "viser" },
     { name = "wandb" },
-    { name = "warp-lang", version = "1.18.0", source = { registry = "https://pypi.nvidia.com/" }, marker = "sys_platform != 'darwin'" },
-    { name = "warp-lang", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "warp-lang" },
 ]
 
 [[package]]
@@ -1013,8 +1012,7 @@ dependencies = [
     { name = "etils", extra = ["epath"] },
     { name = "mujoco" },
     { name = "numpy" },
-    { name = "warp-lang", version = "1.18.0", source = { registry = "https://pypi.nvidia.com/" }, marker = "sys_platform != 'darwin'" },
-    { name = "warp-lang", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "warp-lang" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6f/d8/00a4917ffc224692c5f5bd556df840bccd7160bb67ac345f2f4c2be51bc0/mujoco_warp-3.16.0.tar.gz", hash = "sha256:0852a1facaa97ddc9697e9818cf0e16cf4bbc893f95dab7b61b01882b1c79ee0", size = 2213907, upload-time = "2026-10-14T10:30:10.439Z" }
 wheels = [
@@ -1905,8 +1903,7 @@ dependencies = [
     { name = "torch", version = "2.14.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform != 'darwin'" },
     { name = "tqdm" },
     { name = "tyro" },
-    { name = "warp-lang", version = "1.18.0", source = { registry = "https://pypi.nvidia.com/" }, marker = "sys_platform != 'darwin'" },
-    { name = "warp-lang", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "warp-lang" },
 ]
 
 [package.dev-dependencies]
@@ -1931,8 +1928,7 @@ requires-dist = [
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.14.0" },
     { name = "tqdm" },
     { name = "tyro", specifier = ">=1.0.1" },
-    { name = "warp-lang", marker = "sys_platform != 'darwin'", specifier = ">=1.15.0", index = "https://pypi.nvidia.com/" },
-    { name = "warp-lang", marker = "sys_platform == 'darwin'", specifier = ">=1.15.0" },
+    { name = "warp-lang", specifier = ">=1.15.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -2237,33 +2233,15 @@ wheels = [
 [[package]]
 name = "warp-lang"
 version = "1.18.0"
-source = { registry = "https://pypi.nvidia.com/" }
-resolution-markers = [
-    "sys_platform == 'win32'",
-    "sys_platform == 'emscripten'",
-    "sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-dependencies = [
-    { name = "numpy" },
-]
-wheels = [
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.18.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:090962bfae7dd22ade0d8e0258f41635e0e58980f15bcc9e7a7d312819dfe440" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.18.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:d76ab8c7d4f4897405fa0a744d38812fc44cfc8162c40e658dc9ca7790b6a645" },
-    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.18.0-py3-none-win_amd64.whl", hash = "sha256:1769e55746739f2e244a2b412123003c462ec3d977dfb5f420f924a8553d30aa" },
-]
-
-[[package]]
-name = "warp-lang"
-version = "1.18.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "sys_platform == 'darwin'",
-]
 dependencies = [
     { name = "numpy" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/59/ca/0f88f27e9367b55df2c87fd6dbb96f15871ab7fcca14dd9ec92ec4688a30/warp_lang-1.18.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:3d0a12f411555c08015f84060187a0466800d2c837eb8800977b9604be438c21", size = 27819487, upload-time = "2026-10-05T00:22:32.346Z" },
+    { url = "https://files.pythonhosted.org/packages/13/69/5fc4388c6af4c78cd247776bb6928cabe83d893896444dd2127ccbe8b2ca/warp_lang-1.18.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:090962bfae7dd22ade0d8e0258f41635e0e58980f15bcc9e7a7d312819dfe440", size = 148811186 },
+    { url = "https://files.pythonhosted.org/packages/be/41/6e255904a10cd1b3b1a61cc9ac21551812ffc55b1c68324de4c0c24a6660/warp_lang-1.18.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:d76ab8c7d4f4897405fa0a744d38812fc44cfc8162c40e658dc9ca7790b6a645", size = 147348850 },
+    { url = "https://files.pythonhosted.org/packages/3e/75/888dfe20326fea1a3b46b68a239ccd5db717bb039d511ab6fca7c77e6fea/warp_lang-1.18.0-py3-none-win_amd64.whl", hash = "sha256:1769e55746739f2e244a2b412123003c462ec3d977dfb5f420f924a8553d30aa", size = 134607061 },
 ]
 
 [[package]]

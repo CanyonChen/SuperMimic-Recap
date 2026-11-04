@@ -9,6 +9,7 @@ dependencies = [
   "mjlab",
   # Declared directly so that our [tool.uv.sources] below apply (mjlab's own sources do not propagate).
   "torch>=2.14.0",
+  # Use PyPI for Warp so installation does not require NVIDIA's separate package index.
   "warp-lang>=1.15.0",
   "mujoco-warp~=3.16.0",
   "mujoco~=3.16.0",
@@ -42,7 +43,6 @@ packages = ["src/supermimic"]
 [tool.uv.sources]
 mjlab = { git = "https://github.com/mujocolab/mjlab", rev = "8bb2bc9e187797689ec82c78c35019afd2fd0376" }
 torch = { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" }
-warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
 
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
@@ -50,11 +50,6 @@ url = "https://pypi.org/simple"
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "nvidia"
-url = "https://pypi.nvidia.com/"
 explicit = true
 
 [tool.pytest.ini_options]
