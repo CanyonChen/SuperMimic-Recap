@@ -13,6 +13,7 @@ bash scripts/recap_inference_eval.sh --gpu 1
 | `--skip-prep` | 已有完整 `data/npz/bones_seed/` 和 `manifest.csv` 时跳过解压、转换 |
 | `--skip-full --out logs/repro_e8_subset` | 只做子集，使用独立结果目录 |
 | `--no-render` | 跳过默认开启的视频渲染 |
+| `--render-only` | 为已完成的测评补做视频并更新报告；只需原输出目录及轨迹，不重新推理 |
 | `--skip-push` / `--skip-reference` | 跳过扰动 / 第三方结果下载对照 |
 | `--ckpt` / `--archive` / `--npz-dir` / `--out` | 改用指定路径；相对路径按仓库根目录解释 |
 | `--help` | 查看全部配置选项 |
@@ -36,6 +37,15 @@ bash scripts/recap_inference_eval.sh --gpu 1
 视频中实体为策略执行结果，半透明为参考动作。渲染需要 ffmpeg 和可用的 OpenGL 后端，默认 `MUJOCO_GL=egl`，可通过环境变量改用已配置的后端。渲染失败会保留数值结果和轨迹，在报告中标记警告；不会生成占位视频。
 
 相同命令重跑会复用已经检查通过的阶段和分片。更换权重、数据、评测参数或代码版本时使用新的 `--out`。同一代码版本下，可以对原来 `--no-render` 的运行去掉该选项或增加 `--render`，只补视频。核心阶段失败退出并保存部分报告；可选阶段失败时标记 `completed_with_warnings`。
+
+若测评已经结束，只是视频渲染失败（包括旧版误用位置参数导致缺少 `--traj` / `--out-dir`），更新代码后执行：
+
+```bash
+git pull --ff-only origin main
+bash scripts/recap_inference_eval.sh --render-only --gpu 1 --out logs/repro_e8_auto
+```
+
+此模式沿用原 `run_config.json` 的评测配置，只读取已录制的 `cases/rollouts.npz` 渲染视频，更新渲染状态和报告链接；不会重新解压、转换或推理，也不会改写原权重/代码指纹。其他阶段仍有警告时，流程状态继续保留 `completed_with_warnings`。原输出目录必须已完成测评并保留轨迹、案例清单和报告所需的结果文件。
 
 论文表 A.8 的主参照为 25/129,514（单 H100 训练 3 h）及 0/129,514（双 H100 训练 9.8 h）。当前是第三方权重，数据过滤集合存在差异，且仓库回报按实际执行步数归一化；不能据此宣称训练效率、完整论文回报口径或真机结果已经复现。案例分组和稳定判据也需注明仓库口径。
 

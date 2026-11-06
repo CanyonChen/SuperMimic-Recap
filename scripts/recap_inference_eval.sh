@@ -155,7 +155,11 @@ def arguments(argv=None):
     p.add_argument('--reference', type=Path, help='使用本地第三方 benchmark JSON 或 JSON.gz')
     p.add_argument('--render', action=argparse.BooleanOptionalAction, default=True,
                    help='默认生成案例 MP4；用 --no-render 跳过视频渲染')
+    p.add_argument('--render-only', action='store_true',
+                   help='仅为 --out 中已完成的测评补做视频并更新报告；沿用原评测配置，不重新推理')
     a = p.parse_args(argv)
+    if a.render_only and not a.render:
+        p.error('--render-only cannot be combined with --no-render')
     for key in ['workers', 'num_envs', 'subset_size', 'repeats', 'shard_size']:
         if getattr(a, key) < 1:
             p.error(f'--{key.replace("_", "-")} must be positive')
@@ -256,7 +260,7 @@ class Evaluation:
         for p in paths:
             code.update(str(p.relative_to(self.root)).encode())
             code.update(p.read_bytes())
-        cfg = {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items() if k != 'render'}
+        cfg = {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items() if k not in {'render', 'render_only'}}
         cfg.update(checkpoint_sha256=digest(a.ckpt), code_sha256=code.hexdigest())
         cfg['reference_sha256'] = digest(a.reference) if a.reference and a.reference.is_file() else None
         cfg['archive_stat'] = [a.archive.stat().st_size, a.archive.stat().st_mtime_ns] if a.archive.exists() and not a.skip_prep else None
@@ -264,6 +268,24 @@ class Evaluation:
         if path.exists() and load(path) != cfg:
             raise ValueError('output directory belongs to a different checkpoint/config/code; use a new --out directory')
         save(path, cfg)
+
+    def restore_render_config(self):
+        if self.state.get('status') not in {'completed', 'completed_with_warnings'}:
+            raise ValueError('--render-only requires a completed evaluation; resume unfinished evaluation with its original code/config')
+        if self.state['stages'].get('case_rollouts', {}).get('status') != 'completed':
+            raise ValueError('--render-only requires completed case_rollouts')
+        for path in [self.out / 'cases/selected.csv', self.out / 'cases/rollouts.npz']:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        cfg = load(self.out / 'run_config.json')
+        # Rendering consumes saved trajectories, not the checkpoint or source dataset.
+        # Keep the original evaluation identity intact even after a renderer fix.
+        for key in vars(self.a):
+            if key in cfg and key not in {'gpu', 'out', 'render', 'render_only'}:
+                value = cfg[key]
+                if key in {'ckpt', 'archive', 'raw_dir', 'npz_dir', 'reference'} and value is not None:
+                    value = Path(value)
+                setattr(self.a, key, value)
 
     def environment(self):
         import torch
@@ -439,13 +461,16 @@ class Evaluation:
             self.step('reference_full' if not a.skip_full else 'reference_subset', lambda: self.reference(actual),
                       [self.out / 'reference_comparison.json', self.out / 'reference_comparison.csv'], optional=True)
         if a.render:
-            def render():
-                if not shutil.which('ffmpeg'):
-                    raise RuntimeError('ffmpeg is missing; trajectories are already saved')
-                self.python('render', 'scripts/media/render_rollout.py', self.out / 'cases/rollouts.npz',
-                            self.out / 'cases/videos', '--fps', 25,
-                            extra_env={'MUJOCO_GL': os.environ.get('MUJOCO_GL', 'egl')})
-            self.step('render', render, [self.out / 'cases/videos' / f'{n}.mp4' for n in case_names], optional=True)
+            self.render_cases(case_names)
+
+    def render_cases(self, case_names):
+        def render():
+            if not shutil.which('ffmpeg'):
+                raise RuntimeError('ffmpeg is missing; trajectories are already saved')
+            self.python('render', 'scripts/media/render_rollout.py', '--traj', self.out / 'cases/rollouts.npz',
+                        '--out-dir', self.out / 'cases/videos', '--fps', 25,
+                        extra_env={'MUJOCO_GL': os.environ.get('MUJOCO_GL', 'egl')})
+        self.step('render', render, [self.out / 'cases/videos' / f'{n}.mp4' for n in case_names], optional=True)
 
     def report(self):
         a, summary = self.a, []
@@ -541,7 +566,10 @@ class Evaluation:
     def run(self):
         # Bind before changing status so a rejected resume cannot rewrite an older report.
         try:
-            self.bind_config()
+            if self.a.render_only:
+                self.restore_render_config()
+            else:
+                self.bind_config()
         except Exception:
             self.log_file.close()
             raise
@@ -550,7 +578,10 @@ class Evaluation:
         save(self.state_path, self.state)
         code = 0
         try:
-            self.pipeline()
+            if self.a.render_only:
+                self.render_cases([r['name'] for r in read_csv(self.out / 'cases/selected.csv')])
+            else:
+                self.pipeline()
             failures = [v for v in self.state['stages'].values() if v['status'] == 'failed']
             self.state['status'] = 'completed_with_warnings' if failures else 'completed'
         except (Exception, KeyboardInterrupt) as exc:

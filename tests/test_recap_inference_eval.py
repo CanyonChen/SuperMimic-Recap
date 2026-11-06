@@ -5,6 +5,7 @@ Run without the robotics dependencies:
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import gzip
 import io
@@ -72,7 +73,10 @@ class FakeGPU(recap.Evaluation):
         elif script.endswith("record_rollout.py"):
             Path(arg("--out")).write_bytes(b"fixture trajectory")
         elif script.endswith("render_rollout.py"):
-            output = Path(args[1])
+            self.render_args = [str(a) for a in args]
+            if not Path(arg("--traj")).is_file():
+                raise FileNotFoundError(arg("--traj"))
+            output = Path(arg("--out-dir"))
             output.mkdir(parents=True, exist_ok=True)
             for row in recap.read_csv(self.out / "cases/selected.csv"):
                 (output / f'{row["name"]}.mp4').write_bytes(b"fixture video")
@@ -277,6 +281,82 @@ class RecapTests(unittest.TestCase):
         self.assertEqual(status["stages"]["render"]["status"], "failed")
         self.assertEqual(recap.load(self.root / "out/full.json")["summary"]["clips"], 6)
         self.assertTrue((self.root / "out/cases/rollouts.npz").exists())
+
+    def test_render_only_recovers_old_run_without_checkpoint_or_dataset(self):
+        with patch.object(recap.shutil, "which", return_value="fixture_ffmpeg"):
+            self.run_quietly(FakeGPU(self.args("--render", "--repeats", "2", "--skip-push"), fail_at="render"))
+        config_path = self.root / "out/run_config.json"
+        config = recap.load(config_path)
+        config["code_sha256"] = "legacy code with positional render arguments"
+        recap.save(config_path, config)
+        original_config = config_path.read_bytes()
+        original_result = (self.root / "out/full.json").read_bytes()
+        original_summary = (self.root / "out/summary.json").read_bytes()
+        original_stages = recap.load(self.root / "out/status.json")["stages"]
+        (self.root / "model.pt").unlink()
+        (self.root / "npz").rename(self.root / "npz_unavailable")
+
+        runner = FakeGPU(recap.arguments(["--render-only", "--gpu", "0", "--out", "out"]))
+        with patch.object(recap.shutil, "which", return_value="fixture_ffmpeg"):
+            self.assertEqual(self.run_quietly(runner), 0)
+        self.assertEqual(runner.calls, ["render"])
+        self.assertEqual(runner.env["CUDA_VISIBLE_DEVICES"], "0")
+        self.assertEqual(runner.a.repeats, 2)
+        self.assertTrue(runner.a.skip_push)
+        self.assertEqual(config_path.read_bytes(), original_config)
+        self.assertEqual((self.root / "out/full.json").read_bytes(), original_result)
+        self.assertEqual((self.root / "out/summary.json").read_bytes(), original_summary)
+        status = recap.load(self.root / "out/status.json")
+        self.assertEqual(status["status"], "completed")
+        for name, stage in original_stages.items():
+            if name != "render":
+                self.assertEqual(status["stages"][name], stage)
+        report = (self.root / "out/report.md").read_text(encoding="utf-8")
+        self.assertIn(f"cases/videos/{recap.DEMO}.mp4", report)
+        self.assertNotIn("render exited", report)
+
+    def test_render_only_preserves_other_stage_warnings(self):
+        self.run_quietly(FakeGPU(self.args(), fail_at="push"))
+        runner = FakeGPU(recap.arguments(["--render-only", "--out", "out"]))
+        with patch.object(recap.shutil, "which", return_value="fixture_ffmpeg"):
+            self.assertEqual(self.run_quietly(runner), 0)
+        self.assertEqual(runner.calls, ["render"])
+        status = recap.load(self.root / "out/status.json")
+        self.assertEqual(status["status"], "completed_with_warnings")
+        self.assertEqual(status["stages"]["push"]["status"], "failed")
+        self.assertEqual(status["stages"]["render"]["status"], "completed")
+
+    def test_render_only_rejects_incomplete_evaluation(self):
+        self.run_quietly(FakeGPU(self.args(), fail_at="full_001"))
+        paths = [self.root / "out" / p for p in ["status.json", "report.md", "run_config.json"]]
+        before = [p.read_bytes() for p in paths]
+        runner = FakeGPU(recap.arguments(["--render-only", "--out", "out"]))
+        with self.assertRaisesRegex(ValueError, "requires a completed evaluation"):
+            self.run_quietly(runner)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual([p.read_bytes() for p in paths], before)
+
+    def test_render_command_uses_real_tyro_signature(self):
+        try:
+            import tyro
+        except ImportError:
+            self.skipTest("install tyro to check the actual renderer CLI parser")
+        renderer = SCRIPT.parent / "media/render_rollout.py"
+        module = ast.parse(renderer.read_text(encoding="utf-8"))
+        main = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        # Exercise the real CLI signature without importing MuJoCo/GPU dependencies.
+        main.body = [ast.Return(value=ast.Constant(value=None))]
+        signature = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
+        namespace = {"Path": Path, "__name__": __name__}
+        exec(compile(signature, str(renderer), "exec", dont_inherit=True), namespace)
+        runner = FakeGPU(self.args("--render"))
+        with patch.object(recap.shutil, "which", return_value="fixture_ffmpeg"):
+            self.assertEqual(self.run_quietly(runner), 0)
+        self.assertIsNone(tyro.cli(namespace["main"], args=runner.render_args))
+        legacy_args = [str(runner.out / "cases/rollouts.npz"), str(runner.out / "cases/videos"), "--fps", "25"]
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+            tyro.cli(namespace["main"], args=legacy_args)
+        self.assertEqual(failure.exception.code, 2)
 
 
 if __name__ == "__main__":

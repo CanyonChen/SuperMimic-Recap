@@ -2,7 +2,7 @@
 simulation, translucent blue ghost = reference motion. Writes one mp4 per clip and optionally a concatenated
 highlight; GIF conversion is left to ffmpeg (see README).
 
-  MUJOCO_GL=glfw uv run python scripts/media/render_rollout.py media/rollouts.npz media/out --fps 25 --seconds 6
+  MUJOCO_GL=glfw uv run python scripts/media/render_rollout.py --traj media/rollouts.npz --out-dir media/out --fps 25 --seconds 6
 """
 
 from __future__ import annotations
