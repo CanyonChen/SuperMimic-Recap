@@ -141,6 +141,7 @@ def arguments(argv=None):
     p.add_argument('--archive', type=Path, default=Path('data/raw/bones_seed/g1.tar.gz.part'))
     p.add_argument('--raw-dir', type=Path, default=Path('data/raw/bones_seed'))
     p.add_argument('--npz-dir', type=Path, default=Path('data/npz/bones_seed'))
+    p.add_argument('--manifest', type=Path, help='复用已有过滤清单（name,frames,keep），保证训练与评测使用同一集合')
     p.add_argument('--out', type=Path, default=Path('logs/repro_e8_auto'))
     p.add_argument('--workers', type=int, default=8)
     p.add_argument('--num-envs', type=int, default=256)
@@ -165,7 +166,7 @@ def arguments(argv=None):
             p.error(f'--{key.replace("_", "-")} must be positive')
     if ',' in a.gpu:
         p.error('--gpu accepts one GPU; this script processes shards sequentially')
-    for key in ['ckpt', 'archive', 'raw_dir', 'npz_dir', 'out', 'reference']:
+    for key in ['ckpt', 'archive', 'raw_dir', 'npz_dir', 'out', 'reference', 'manifest']:
         if getattr(a, key) is not None:
             setattr(a, key, getattr(a, key).resolve())
     return a
@@ -263,6 +264,7 @@ class Evaluation:
         cfg = {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items() if k not in {'render', 'render_only'}}
         cfg.update(checkpoint_sha256=digest(a.ckpt), code_sha256=code.hexdigest())
         cfg['reference_sha256'] = digest(a.reference) if a.reference and a.reference.is_file() else None
+        cfg['manifest_sha256'] = digest(a.manifest) if a.manifest else None
         cfg['archive_stat'] = [a.archive.stat().st_size, a.archive.stat().st_mtime_ns] if a.archive.exists() and not a.skip_prep else None
         path = self.out / 'run_config.json'
         if path.exists() and load(path) != cfg:
@@ -283,7 +285,7 @@ class Evaluation:
         for key in vars(self.a):
             if key in cfg and key not in {'gpu', 'out', 'render', 'render_only'}:
                 value = cfg[key]
-                if key in {'ckpt', 'archive', 'raw_dir', 'npz_dir', 'reference'} and value is not None:
+                if key in {'ckpt', 'archive', 'raw_dir', 'npz_dir', 'reference', 'manifest'} and value is not None:
                     value = Path(value)
                 setattr(self.a, key, value)
 
@@ -373,6 +375,19 @@ class Evaluation:
             shards.append(name)
         save(self.out / 'lists/index.json', dict(kept=len(names), shards=shards))
 
+    def reuse_manifest(self):
+        rows = read_csv(self.a.manifest)
+        source = {r['name']: r for r in read_csv(self.a.npz_dir / 'manifest.csv')}
+        names = [r['name'] for r in rows]
+        if not rows or len(names) != len(set(names)) or set(names) != set(source):
+            raise ValueError('filter manifest does not cover the NPZ manifest exactly')
+        for r in rows:
+            if r['keep'] not in {'0', '1'} or int(r['frames']) != int(source[r['name']]['frames']):
+                raise ValueError(f'invalid filter row: {r["name"]}')
+        destination = self.out / 'manifest_filtered.csv'
+        if self.a.manifest.resolve() != destination.resolve():
+            shutil.copyfile(self.a.manifest, destination)
+
     def benchmark(self, stage, names, data, output, num_envs):
         path = self.out / output
         clip_list = self.out / 'lists' / f'{stage}.txt'
@@ -427,8 +442,11 @@ class Evaluation:
                       '--workers', a.workers), [a.npz_dir / 'manifest.csv'], self.audit_data)
         else:
             self.audit_data()
-        self.step('filter', lambda: self.python('filter', 'scripts/data/filter_bones_seed.py', '--npz-dir', a.npz_dir,
-                  '--workers', a.workers, '--out', self.out / 'manifest_filtered.csv'), [self.out / 'manifest_filtered.csv'])
+        if a.manifest:
+            self.step('filter', self.reuse_manifest, [self.out / 'manifest_filtered.csv'])
+        else:
+            self.step('filter', lambda: self.python('filter', 'scripts/data/filter_bones_seed.py', '--npz-dir', a.npz_dir,
+                      '--workers', a.workers, '--out', self.out / 'manifest_filtered.csv'), [self.out / 'manifest_filtered.csv'])
         self.step('lists', self.make_lists, [self.out / 'lists/index.json', self.out / 'lists/all.txt', self.out / 'lists/subset.txt'])
         if not (demo_dir / f'{DEMO}.npz').exists():
             self.benchmark('single', [DEMO], a.npz_dir, 'single.json', 1)

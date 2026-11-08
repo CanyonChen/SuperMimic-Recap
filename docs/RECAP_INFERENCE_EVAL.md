@@ -11,6 +11,7 @@ bash scripts/recap_inference_eval.sh --gpu 1
 | 选项 | 用途 |
 |---|---|
 | `--skip-prep` | 已有完整 `data/npz/bones_seed/` 和 `manifest.csv` 时跳过解压、转换 |
+| `--manifest PATH` | 复用已有过滤清单，保证训练和评测使用同一批动作；必须覆盖转换清单的全部行并保留 `keep` 标记 |
 | `--skip-full --out logs/repro_e8_subset` | 只做子集，使用独立结果目录 |
 | `--no-render` | 跳过默认开启的视频渲染 |
 | `--render-only` | 为已完成的测评补做视频并更新报告；只需原输出目录及轨迹，不重新推理 |

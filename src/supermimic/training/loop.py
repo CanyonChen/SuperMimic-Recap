@@ -107,6 +107,8 @@ class Trainer:
     def save(self, name: str = "ckpt_latest.pt") -> None:
         if not self.is_main:
             return
+        path = self.log_dir / name
+        temporary = path.with_name(path.name + ".tmp")
         torch.save(
             {
                 "iteration": self.iteration,
@@ -121,8 +123,9 @@ class Trainer:
                 "bin_memory": self.command.bin_memory,
                 "config": asdict(self.cfg),
             },
-            self.log_dir / name,
+            temporary,
         )
+        temporary.replace(path)
 
     def load(self, path: Path) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)

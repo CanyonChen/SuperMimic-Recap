@@ -72,6 +72,8 @@ uv run python scripts/data/build_library.py --help
 
 ### Training
 
+For automated single-GPU BONES training with a 40 GiB budget, checkpoint evaluation, reports and videos, see [the training reproduction guide](docs/RECAP_TRAINING_EVAL.md): `bash scripts/recap_training_eval.sh --gpu 1 --vram-gb 40`.
+
 ```bash
 # LAFAN1, paper observations, one GPU
 env -u PYTHONPATH uv run sm-train --run-name lafan1 --data.npz-dir data/npz/lafan1 \
