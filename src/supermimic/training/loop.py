@@ -113,6 +113,7 @@ class Trainer:
             {
                 "iteration": self.iteration,
                 "num_updates": self.num_updates,
+                "world_size": self.world,
                 "wm": self.wm.state_dict(),
                 "policy": self.policy.state_dict(),
                 "critic": self.critic.state_dict(),
@@ -148,7 +149,7 @@ class Trainer:
     def act(self, obs) -> torch.Tensor:
         return self.policy(obs["policy"], obs["goal"])
 
-    def run(self) -> None:
+    def run(self, on_log=None) -> None:
         cfg = self.cfg
         sch = cfg.schedule
         env = self.env
@@ -257,6 +258,8 @@ class Trainer:
                         f"t sim/wm/pi {timers['sim']:.1f}/{timers['wm']:.1f}/{timers['policy']:.1f}s"
                     )
                     print(msg, flush=True)
+                if on_log is not None:
+                    on_log(it)  # Every rank can record its own memory usage.
                 agg, agg_n = {}, 0
                 finished_returns, finished_lens = [], []
                 timers = {k: 0.0 for k in timers}

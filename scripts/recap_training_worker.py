@@ -1,4 +1,4 @@
-"""Single-GPU training with a PyTorch memory allowance and per-process measurements.
+"""One training rank with a PyTorch memory allowance and per-process measurements.
 
 Called by recap_training_eval.sh; remaining CLI arguments are parsed by the real TrainConfig.
 """
@@ -16,6 +16,35 @@ import time
 
 GIB = 1024**3
 WARP_RESERVE_GIB = 4.0
+
+
+def pin_rank(gpus, local_rank_arg=None):
+    """Pin MuJoCo Warp and torch to the same GPU before either library is imported."""
+    devices = [g.strip() for g in gpus.split(',')]
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    local_world = int(os.environ.get('LOCAL_WORLD_SIZE', str(world)))
+    if (world != len(devices) or local_world != world or rank != local_rank
+            or not 0 <= local_rank < world or any(not d for d in devices)
+            or len(set(devices)) != len(devices)):
+        raise ValueError('GPU list must match this single-node torchrun worker group')
+    if local_rank_arg is not None and local_rank_arg != local_rank:
+        raise ValueError('--local-rank differs from LOCAL_RANK')
+    selected = devices[local_rank]
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = selected
+    os.environ['SM_GPU_PINNED'] = '1'
+    if world > 1:
+        os.environ['SM_DIST_BACKEND'] = 'nccl'
+        try:
+            cores = sorted(os.sched_getaffinity(0))
+            per = len(cores) // world
+            if per >= 2:
+                os.sched_setaffinity(0, set(cores[local_rank*per:(local_rank+1)*per]))
+        except (AttributeError, OSError, ValueError):
+            pass
+    return rank, world, selected
 
 
 def process_memory_gib(text, pid):
@@ -71,29 +100,31 @@ class BudgetWriter:
         if tag in {'wm/loss', 'wm/grad_norm', 'policy/policy_grad_norm', 'policy/critic_loss'}:
             if not math.isfinite(float(value)):
                 raise RuntimeError(f'non-finite training metric at iteration {step}: {tag}={value}')
-        self.writer.add_scalar(tag, value, step, *args, **kwargs)
-        if tag == 'time/hours':
-            self.sample(step)
+        if self.writer is not None:
+            self.writer.add_scalar(tag, value, step, *args, **kwargs)
 
     def flush(self):
-        self.writer.flush()
+        if self.writer is not None:
+            self.writer.flush()
 
     def close(self):
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.close()
         self.file.close()
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('--gpu', required=True)
+    parser.add_argument('--gpus', '--gpu', dest='gpus', required=True)
+    parser.add_argument('--local-rank', '--local_rank', type=int)
     parser.add_argument('--memory-gib', type=float, required=True)
     args, training_args = parser.parse_known_args(argv)
-    if args.memory_gib <= WARP_RESERVE_GIB:
+    if not math.isfinite(args.memory_gib) or args.memory_gib <= WARP_RESERVE_GIB:
         parser.error('--memory-gib must exceed the 4 GiB reserve for Warp/context')
-    if int(os.environ.get('WORLD_SIZE', '1')) != 1:
-        parser.error('this worker is single-GPU; launch recap_training_eval.sh directly')
+    rank, world, gpu = pin_rank(args.gpus, args.local_rank)
+    print(f'[rank {rank}/{world}] PID {os.getpid()}, physical GPU {gpu} -> cuda:0; importing training libraries', flush=True)
 
-    # The parent selects CUDA_VISIBLE_DEVICES before this process imports torch.
+    # Each rank sees only its own GPU, including MuJoCo Warp's implicit first device.
     import torch
     import tyro
     from supermimic.config import TrainConfig
@@ -110,6 +141,7 @@ def main(argv=None):
         raise ValueError('memory budget exceeds physical GPU memory')
     torch.cuda.set_per_process_memory_fraction(torch_allowance / total, 0)
     torch.cuda.reset_peak_memory_stats()
+    print(f'[rank {rank}] GPU {gpu}: budget {args.memory_gib:g} GiB, PyTorch allowance {torch_allowance/GIB:g} GiB', flush=True)
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'signal {signum}; restart the parent command to resume its last checkpoint')
@@ -119,9 +151,12 @@ def main(argv=None):
             signal.signal(sig, interrupted)
 
     directory = cfg.log_root / cfg.run_name
+    if rank != 0:
+        directory = directory / f'rank_{rank}'
     directory.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    attempt = dict(pid=os.getpid(), started_at=time.time(), budget_gib=args.memory_gib,
+    attempt = dict(pid=os.getpid(), rank=rank, world_size=world, physical_gpu=gpu,
+        started_at=time.time(), budget_gib=args.memory_gib,
         torch_allowance_gib=torch_allowance/GIB, warp_context_reserve_gib=WARP_RESERVE_GIB,
         resume=str(cfg.resume) if cfg.resume else None, status='failed')
     trainer = monitor = None
@@ -129,14 +164,15 @@ def main(argv=None):
     try:
         trainer = Trainer(cfg)
         attempt['start_iteration'] = trainer.iteration
-        monitor = BudgetWriter(trainer.writer, torch, directory, args.gpu, args.memory_gib)
-        trainer.writer = monitor
+        monitor = BudgetWriter(trainer.writer, torch, directory, gpu, args.memory_gib)
+        if trainer.is_main:
+            trainer.writer = monitor
         monitor.sample(trainer.iteration)
         if cfg.resume is None:
             trainer.save('ckpt_0000000.pt')
         attempt['initialization_s'] = time.perf_counter()-started
         loop_start = time.perf_counter()
-        trainer.run()
+        trainer.run(on_log=monitor.sample)
         attempt['status'] = 'completed'
     except BaseException as exc:
         attempt['error'] = str(exc) or type(exc).__name__

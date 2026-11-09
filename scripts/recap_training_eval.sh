@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# From any directory: bash scripts/recap_training_eval.sh --gpu 1
+# Dual H100: bash scripts/recap_training_eval.sh --gpus 0,1
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 command -v uv >/dev/null || { echo 'uv is required; use the configured SuperMimic environment.' >&2; exit 1; }

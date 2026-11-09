@@ -72,7 +72,7 @@ uv run python scripts/data/build_library.py --help
 
 ### Training
 
-For automated single-GPU BONES training with a 40 GiB budget, checkpoint evaluation, reports and videos, see [the training reproduction guide](docs/RECAP_TRAINING_EVAL.md): `bash scripts/recap_training_eval.sh --gpu 1 --vram-gb 40`.
+For automated BONES training, checkpoint evaluation, reports and videos, see [the training reproduction guide](docs/RECAP_TRAINING_EVAL.md). Use `bash scripts/recap_training_eval.sh --gpus 0,1` for two H100s (4096 environments and policy batch 4096 per GPU, 72 GiB budget per GPU), or `--gpu 1 --vram-gb 40` for the smaller single-GPU profile.
 
 ```bash
 # LAFAN1, paper observations, one GPU

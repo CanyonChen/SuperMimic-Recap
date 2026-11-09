@@ -200,6 +200,7 @@ class Evaluation:
             with subprocess.Popen(command, cwd=self.root, env={**self.env, **(extra_env or {})},
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                   encoding='utf-8', errors='replace', start_new_session=(os.name != 'nt')) as proc:
+                self.log(f'[process] {name}: PID {proc.pid}; log: {self.out / "logs" / f"{name}.log"}')
                 try:
                     for line in proc.stdout:
                         self.log(line.rstrip('\n'))
@@ -335,6 +336,7 @@ class Evaluation:
 
     def audit_data(self):
         a = self.a
+        self.log(f'[data audit] reading manifest and listing NPZ files: {a.npz_dir}')
         rows = read_csv(a.npz_dir / 'manifest.csv')
         by_name = {r['name']: r for r in rows}
         files = sorted(a.npz_dir.glob('*.npz'))
@@ -348,9 +350,13 @@ class Evaluation:
             if set(expected) != set(by_name):
                 raise ValueError(f'CSV/NPZ coverage mismatch: {len(expected)} source, {len(by_name)} converted; check conversion.log')
         inventory = hashlib.sha256()
-        for p in files:
+        started = time.perf_counter()
+        self.log(f'[data audit] checking metadata for {len(files):,} NPZ files')
+        for index, p in enumerate(files, 1):
             st = p.stat()
             inventory.update(f'{p.name}:{st.st_size}:{st.st_mtime_ns}\n'.encode())
+            if index % 10000 == 0 or index == len(files):
+                self.log(f'[data audit] {index:,}/{len(files):,}; {time.perf_counter()-started:.0f}s elapsed')
         identity = dict(manifest_sha256=digest(a.npz_dir / 'manifest.csv'), npz_inventory_sha256=inventory.hexdigest())
         identity_path = self.out / 'dataset_identity.json'
         if identity_path.exists() and load(identity_path) != identity:

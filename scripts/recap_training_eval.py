@@ -1,4 +1,4 @@
-"""Automate fresh BONES training, checkpoint evaluation, and reports on one shared GPU."""
+"""Automate fresh BONES training, checkpoint evaluation, and reports on one or two GPUs."""
 from __future__ import annotations
 
 import argparse
@@ -34,17 +34,17 @@ read_csv, write_csv, lines = recap.read_csv, recap.write_csv, recap.lines
 
 def arguments(argv=None):
     p = argparse.ArgumentParser(prog='recap_training_eval.sh',
-        description='从零训练 + 全量推理测评；单 GPU、40 GiB 预算。同配置重跑自动续训。')
-    p.add_argument('--gpu', default='1', help='物理 GPU 编号或 UUID；只使用一张卡')
-    p.add_argument('--vram-gb', type=float, default=40, help='显存预算，单位 GiB；其中 4 GiB 留给 Warp/上下文')
+        description='从零训练 + 全量推理测评；--gpus 0,1 启用双卡同步训练。同配置重跑自动续训。')
+    p.add_argument('--gpu', '--gpus', dest='gpu', default='1', help='物理 GPU 编号或 UUID；双卡用 0,1')
+    p.add_argument('--vram-gb', type=float, help='每卡预算 GiB：单卡默认 40，双卡默认 72；各留 4 GiB 给 Warp/上下文')
     p.add_argument('--npz-dir', type=Path, default=Path('data/npz/bones_seed'))
     p.add_argument('--manifest', type=Path, help='已有过滤清单；默认复用上次推理测评的清单，找不到则自动过滤')
     p.add_argument('--library', type=Path, default=Path('data/library/bones_seed_train_40g.pt'))
-    p.add_argument('--out', type=Path, default=Path('logs/repro_train_40g'))
+    p.add_argument('--out', type=Path, help='默认单卡 logs/repro_train_40g，双卡 logs/repro_train_2xh100')
     p.add_argument('--workers', type=int, default=8)
-    p.add_argument('--num-envs', type=int, default=4096)
-    p.add_argument('--policy-batch', type=int, default=2048)
-    p.add_argument('--wm-batch', type=int, default=2048)
+    p.add_argument('--num-envs', type=int, default=4096, help='每张卡的并行环境数')
+    p.add_argument('--policy-batch', type=int, help='每张卡的策略批量；单卡默认 2048，双卡默认 4096')
+    p.add_argument('--wm-batch', type=int, default=2048, help='每张卡的世界模型批量')
     p.add_argument('--replay-capacity', type=int, default=1000)
     p.add_argument('--iterations', type=int, default=320000)
     p.add_argument('--checkpoint-interval', type=int, default=4000)
@@ -61,14 +61,23 @@ def arguments(argv=None):
     p.add_argument('--skip-reference', action='store_true')
     p.add_argument('--render', action=argparse.BooleanOptionalAction, default=True)
     a = p.parse_args(argv)
+    gpus = [g.strip() for g in a.gpu.split(',')]
+    if len(gpus) not in (1, 2) or any(not g for g in gpus) or len(set(gpus)) != len(gpus):
+        p.error('--gpus requires one or two distinct GPU identifiers')
+    a.gpu = ','.join(gpus)
+    dual = len(gpus) == 2
+    if a.vram_gb is None:
+        a.vram_gb = 72 if dual else 40
+    if a.policy_batch is None:
+        a.policy_batch = 4096 if dual else 2048
+    if a.out is None:
+        a.out = Path('logs/repro_train_2xh100' if dual else 'logs/repro_train_40g')
     for key in ('workers', 'num_envs', 'policy_batch', 'wm_batch', 'replay_capacity', 'iterations',
                 'checkpoint_interval', 'smoke_iterations', 'eval_every', 'eval_num_envs', 'subset_size', 'repeats', 'shard_size'):
         if getattr(a, key) < 1:
             p.error(f'--{key.replace("_", "-")} must be positive')
     if not math.isfinite(a.vram_gb) or a.vram_gb <= 4:
         p.error('--vram-gb must exceed 4 GiB')
-    if ',' in a.gpu or not a.gpu:
-        p.error('--gpu accepts one GPU only')
     if a.smoke_iterations < 100 or a.iterations < a.smoke_iterations or a.replay_capacity < 42:
         p.error('need smoke-iterations >= 100, iterations >= smoke-iterations, replay-capacity >= 42')
     if a.manifest is None:
@@ -81,6 +90,22 @@ def arguments(argv=None):
             setattr(a, key, getattr(a, key).resolve())
     a.skip_prep = True  # The already converted data are audited by the shared evaluator.
     return a
+
+
+def gpu_ids(a):
+    return a.gpu.split(',')
+
+
+def runtime_directory(directory, rank):
+    return directory if rank == 0 else directory / f'rank_{rank}'
+
+
+def worker_launch(a, script, target_flags):
+    worker = [str(script), '--gpus', a.gpu, '--memory-gib', str(a.vram_gb), *target_flags]
+    if len(gpu_ids(a)) == 1:
+        return [sys.executable, '-u', *worker]
+    return [sys.executable, '-u', '-m', 'torch.distributed.run', '--standalone', '--nnodes=1',
+            '--nproc-per-node=2', '--max-restarts=0', *worker]
 
 
 def training_flags(a, stage, target, resume=None):
@@ -139,8 +164,8 @@ class TrainingEvaluation(recap.Evaluation):
             raise ValueError('output belongs to a different training config/code/data manifest; choose a new --out')
         save(path, config)
 
-    def gpu_info(self):
-        result = subprocess.run(['nvidia-smi', '-i', self.a.gpu,
+    def gpu_info(self, gpu):
+        result = subprocess.run(['nvidia-smi', '-i', gpu,
             '--query-gpu=uuid,name,memory.total,memory.free,driver_version', '--format=csv,noheader,nounits'],
             capture_output=True, text=True, check=True, timeout=15)
         rows = list(csv.reader(result.stdout.strip().splitlines()))
@@ -150,16 +175,22 @@ class TrainingEvaluation(recap.Evaluation):
         return dict(uuid=uuid, name=name, total_gib=float(total)/1024, free_gib=float(free)/1024, driver=driver)
 
     def ensure_memory(self):
-        gpu = self.gpu_info()
-        self.log(f'GPU {self.a.gpu}: {gpu["free_gib"]:.2f} GiB free; requested budget {self.a.vram_gb:g} GiB')
-        if gpu['free_gib'] < self.a.vram_gb:
-            raise RuntimeError('not enough free VRAM for the requested budget; wait for the shared GPU, then rerun')
-        return gpu
+        devices = []
+        for selected in gpu_ids(self.a):
+            gpu = self.gpu_info(selected)
+            self.log(f'GPU {selected}: {gpu["free_gib"]:.2f} GiB free; requested per-GPU budget {self.a.vram_gb:g} GiB')
+            if gpu['free_gib'] < self.a.vram_gb:
+                raise RuntimeError(f'GPU {selected}: not enough free VRAM for the requested budget; wait, then rerun')
+            devices.append(dict(selected=selected, **gpu))
+        if len({g['uuid'] for g in devices}) != len(devices):
+            raise ValueError('GPU identifiers resolve to the same physical device')
+        return devices
 
     def environment(self):
-        gpu = self.ensure_memory()
+        devices = self.ensure_memory()
         save(self.out / 'environment/runtime.json', dict(time=recap.stamp(), python=sys.version,
-             platform=platform.platform(), selected_gpu=self.a.gpu, gpu=gpu, vram_budget_gib=self.a.vram_gb))
+             platform=platform.platform(), selected_gpus=gpu_ids(self.a), gpus=devices,
+             world_size=len(devices), per_gpu_vram_budget_gib=self.a.vram_gb))
         for name, command in [('gpu', ['nvidia-smi']), ('packages', ['uv', 'pip', 'freeze']),
                               ('commit', ['git', 'rev-parse', 'HEAD']), ('working_tree', ['git', 'status', '--short'])]:
             result = subprocess.run(command, cwd=self.root, env=self.env, capture_output=True, text=True)
@@ -239,6 +270,8 @@ class TrainingEvaluation(recap.Evaluation):
                 raise ValueError(f'{path}: missing {key}')
         if not profile_matches(ck['config'], self.a, stage, target):
             raise ValueError(f'{path}: training configuration does not match this run')
+        if ck.get('world_size', 1) != len(gpu_ids(self.a)):
+            raise ValueError(f'{path}: checkpoint GPU count does not match this run')
         iteration, updates = int(ck['iteration']), int(ck['num_updates'])
         if not 0 <= iteration <= target or updates < 0:
             raise ValueError('invalid checkpoint iteration/update count')
@@ -247,7 +280,7 @@ class TrainingEvaluation(recap.Evaluation):
                 raise ValueError(f'{path}: empty or non-finite {key} weights')
         if updates > 0 and any(not ck[key]['state'] for key in ('wm_opt', 'policy_opt', 'critic_opt')):
             raise ValueError('checkpoint has no optimizer state for a trained model')
-        return dict(path=str(path), iteration=iteration, num_updates=updates)
+        return dict(path=str(path), iteration=iteration, num_updates=updates, world_size=ck.get('world_size', 1))
 
     def resume_checkpoint(self, stage, target):
         directory = self.out / stage
@@ -267,17 +300,22 @@ class TrainingEvaluation(recap.Evaluation):
         self.ensure_memory()
         resume = self.resume_checkpoint(stage, target)
         self.log(f'{stage}: resume {resume}' if resume else f'{stage}: fresh random initialization; no pretrained weights')
-        self.python(stage, 'scripts/recap_training_worker.py', '--gpu', self.a.gpu, '--memory-gib', self.a.vram_gb,
-                    *training_flags(self.a, stage, target, resume))
+        self.command(stage, worker_launch(self.a, self.root / 'scripts/recap_training_worker.py',
+                                         training_flags(self.a, stage, target, resume)))
 
     def completed_training(self, stage, target):
         info = self.checkpoint_info(self.out / stage / 'ckpt_latest.pt', stage, target)
-        runtime = load(self.out / stage / 'runtime.json')
-        if info['iteration'] != target or info['num_updates'] < 1 or runtime['status'] != 'completed':
+        if info['iteration'] != target or info['num_updates'] < 1:
             raise ValueError(f'{stage}: training did not finish the requested iterations with parameter updates')
-        peak = runtime.get('sampled_process_peak_gib')
-        if peak is not None and peak > self.a.vram_gb:
-            raise ValueError('measured process memory exceeded the configured budget')
+        for rank in range(len(gpu_ids(self.a))):
+            runtime = load(runtime_directory(self.out / stage, rank) / 'runtime.json')
+            if (runtime['status'] != 'completed' or runtime['iteration'] != target
+                    or runtime['num_updates'] != info['num_updates']
+                    or runtime.get('world_size', 1) != len(gpu_ids(self.a))):
+                raise ValueError(f'{stage}: rank {rank} did not complete this training run')
+            peak = runtime.get('sampled_process_peak_gib')
+            if peak is not None and peak > self.a.vram_gb:
+                raise ValueError(f'rank {rank}: measured process memory exceeded the configured budget')
         save(self.out / stage / 'checkpoint_metadata.json', info)
 
     def export_curves(self):
@@ -307,11 +345,12 @@ class TrainingEvaluation(recap.Evaluation):
             name = f'checkpoint_eval_{iteration:07d}'
             self.step(name, lambda ckpt=ckpt, output=output, name=name: self.python(name, 'scripts/eval_benchmark.py',
                 '--ckpt', ckpt, '--npz-dir', self.a.npz_dir, '--clip-list', self.out / 'lists/subset.txt',
-                '--num-envs', self.a.eval_num_envs, '--out', output), [output], lambda output=output: recap.checked_result(output, subset))
+                '--num-envs', self.a.eval_num_envs, '--out', output,
+                extra_env={'CUDA_VISIBLE_DEVICES': gpu_ids(self.a)[0]}), [output], lambda output=output: recap.checked_result(output, subset))
 
     def evaluate_final(self):
         a = self.a
-        command = ['bash', self.root / 'scripts/recap_inference_eval.sh', '--gpu', a.gpu,
+        command = ['bash', self.root / 'scripts/recap_inference_eval.sh', '--gpu', gpu_ids(a)[0],
             '--ckpt', self.out / 'train/ckpt_latest.pt', '--npz-dir', a.npz_dir, '--manifest', self.filtered,
             '--out', self.out / 'evaluation', '--skip-prep', '--workers', a.workers,
             '--num-envs', a.eval_num_envs, '--subset-size', a.subset_size, '--repeats', a.repeats,
@@ -337,6 +376,10 @@ class TrainingEvaluation(recap.Evaluation):
         recap.checked_result(result, expected)
 
     def pipeline(self):
+        world = len(gpu_ids(self.a))
+        self.log(f'training profile: {world} GPU(s) [{self.a.gpu}], {self.a.num_envs} envs/GPU '
+                 f'({world*self.a.num_envs} total), policy batch {self.a.policy_batch}/GPU, '
+                 f'WM batch {self.a.wm_batch}/GPU; output: {self.out}')
         self.step('environment', self.environment, [self.out / 'environment/runtime.json'])
         self.prepare_data()
         self.step('library', self.build_library, [self.a.library, self.library_meta], self.validate_library)
@@ -359,6 +402,7 @@ class TrainingEvaluation(recap.Evaluation):
 
     def report(self):
         a = self.a
+        world = len(gpu_ids(a))
         attempts = [load(p) for p in sorted((self.out / 'train').glob('runtime_*.json'))]
         checkpoint = self.out / 'train/checkpoint_metadata.json'
         data = load(self.out / 'training_data.json') if (self.out / 'training_data.json').exists() else {}
@@ -367,8 +411,17 @@ class TrainingEvaluation(recap.Evaluation):
             training_process_wall_s=sum(r['process_wall_s'] for r in attempts),
             training_loop_s=sum(r['loop_s'] for r in attempts), attempts=len(attempts),
             profile=dict(gpu=a.gpu, vram_budget_gib=a.vram_gb, num_envs=a.num_envs,
+                         world_size=world, total_envs=world*a.num_envs, total_policy_batch=world*a.policy_batch,
                          policy_batch=a.policy_batch, wm_batch=a.wm_batch, replay_capacity=a.replay_capacity))
-        peaks = [r['sampled_process_peak_gib'] for r in attempts if r.get('sampled_process_peak_gib') is not None]
+        ranks = []
+        for rank, gpu in enumerate(gpu_ids(a)):
+            records = [load(p) for p in sorted(runtime_directory(self.out / 'train', rank).glob('runtime_*.json'))]
+            values = [r['sampled_process_peak_gib'] for r in records if r.get('sampled_process_peak_gib') is not None]
+            ranks.append(dict(rank=rank, gpu=gpu, process_wall_s=sum(r['process_wall_s'] for r in records),
+                              attempts=len(records), sampled_process_peak_gib=max(values) if values else None))
+        summary['ranks'] = ranks
+        summary['gpu_process_hours'] = sum(r['process_wall_s'] for r in ranks)/3600
+        peaks = [r['sampled_process_peak_gib'] for r in ranks if r['sampled_process_peak_gib'] is not None]
         summary['sampled_process_peak_gib'] = max(peaks) if peaks else None
         save(self.out / 'training_summary.json', summary)
         curve = []
@@ -389,24 +442,26 @@ class TrainingEvaluation(recap.Evaluation):
         text = ['**SuperMimic 从零训练与推理测评报告**', '', f'状态：`{self.state["status"]}`；生成时间：{recap.stamp()}。',
             f'正式训练目标 {a.iterations:,} 次迭代；先独立试训 {a.smoke_iterations} 次，正式训练不继承试训权重。',
             f'训练动作数：{data.get("clips", "尚未校验")}；数据与评测共用 manifest_filtered.csv。', '',
-            f'单卡 GPU {a.gpu}，预算 {a.vram_gb:g} GiB；{a.num_envs} 个环境，策略批 {a.policy_batch}，世界模型批 {a.wm_batch}。',
+            f'{world} 张 GPU [{a.gpu}] 同步训练；每卡预算 {a.vram_gb:g} GiB、{a.num_envs} 个环境、策略批 {a.policy_batch}、世界模型批 {a.wm_batch}。',
+            f'总环境数 {world*a.num_envs}，总策略批量 {world*a.policy_batch}；学习率按 sqrt({world}) 缩放。',
             '保留 H=32、k=8、UTD=0.4、Critic 和仓库的网络/噪声/随机化设置；完整参数见 train/config.json。',
-            '该配置用于共享显存条件下复现第三方训练流程；单卡、策略批量等与原论文/第三方四卡 e8 有差别，不保证相同迭代达到相同指标。', '',
-            f'正式训练进程累计耗时 {summary["training_process_wall_s"]/3600:.3f} h，其中训练循环 {summary["training_loop_s"]/3600:.3f} h；尝试次数 {len(attempts)}。',
-            f'正式训练进程采样显存峰值：{summary["sampled_process_peak_gib"]} GiB；完整记录见 train/memory.csv 和 runtime_*.json。',
+            '使用第三方实现与本仓库过滤集合；具体卡数/批量见上方，不保证相同迭代达到原论文或第三方四卡 e8 的指标。', '',
+            f'正式训练 rank 0 进程累计耗时 {summary["training_process_wall_s"]/3600:.3f} h，其中训练循环 {summary["training_loop_s"]/3600:.3f} h；尝试次数 {len(attempts)}。',
+            f'所有训练 rank 的累计进程时长 {summary["gpu_process_hours"]:.3f} GPU·h；含初始化与等待，不等于纯 GPU 运算时间。',
+            f'各卡进程采样显存峰值的最大值：{summary["sampled_process_peak_gib"]} GiB；rank 0 在 train/，rank 1 在 train/rank_1/，各有 memory.csv 和 runtime_*.json。',
             '此计时排除数据打包、独立试训和推理评测；含重启/失败尝试，不直接等同论文的训练耗时。',
             'PyTorch 分配器额度为预算减 4 GiB；进程显存按日志点采样，容器可能看不到匹配 PID。这不是硬件隔离或连续峰值证明。', '',
             '**训练记录**', '', '- [TensorBoard 标量导出](training_curves.csv)；原始事件位于 train/tb/。',
             '- [最终训练指标](training_metrics.json)：世界模型 loss、在线 8 步误差、训练回报、策略梯度和 Critic loss。',
             '- [检查点子集评测曲线](checkpoint_eval.csv)：先完成训练，再顺序测试已有检查点，避免和训练同时占用显存。',
             '- train/ckpt_latest.pt 是正式训练权重；smoke/ 仅用于流程和显存验证。',
-            '- 中断后恢复模型、优化器、采样器状态；回放缓冲区重新预热，不是逐位一致的无缝续训。', '',
+            '- 中断后恢复模型、优化器、rank 0 保存的采样器状态；各卡回放缓冲区重新预热，不是逐位一致的无缝续训。', '',
             '**训练后测评**', '', '- [完整推理测评报告](evaluation/report.md)',
             '- [失败率与回报](evaluation/summary.csv)；逐动作结果、扰动、第三方对照见 evaluation/。',
             '- [案例清单](evaluation/cases/selected.csv)；MP4 位于 evaluation/cases/videos/。', '',
             '论文参照：25/129,514（单 H100 训练 3 h）、0/129,514（双 H100 训练 9.8 h）。第三方 e8：145/129,491，均值约 0.932。',
             '训练回报和世界模型在线误差来自本次训练日志；基准回报按实际执行步数归一化，与论文完整回合口径存在差异。',
-            'BONES 测评衡量训练动作覆盖；这里没有评估未见动作泛化、真机部署或双卡训练效率。', '']
+            f'BONES 测评衡量训练动作覆盖；后续推理测评在 GPU {gpu_ids(a)[0]} 上顺序执行。未评估未见动作泛化和真机部署，也未通过配对的单/双卡实验测量加速比。', '']
         for name, stage in self.state['stages'].items():
             if stage.get('status') == 'failed':
                 text.append(f'- 未完成阶段 {name}：{stage.get("error", "interrupted")}')

@@ -36,9 +36,11 @@ class FakeTraining(training.TrainingEvaluation):
     def __init__(self, args, fail_at=None, inner_failure=None, free_gib=44.5):
         super().__init__(args)
         self.calls, self.fail_at, self.inner_failure, self.free_gib = [], fail_at, inner_failure, free_gib
+        self.launches = []
 
-    def gpu_info(self):
-        return dict(name='fixture GPU', free_gib=self.free_gib, total_gib=80, uuid='GPU-fixture', driver='fixture')
+    def gpu_info(self, gpu):
+        free = self.free_gib[gpu] if isinstance(self.free_gib, dict) else self.free_gib
+        return dict(name='fixture GPU', free_gib=free, total_gib=80, uuid=f'GPU-fixture-{gpu}', driver='fixture')
 
     def environment(self):
         training.save(self.out / 'environment/runtime.json', self.ensure_memory())
@@ -52,7 +54,10 @@ class FakeTraining(training.TrainingEvaluation):
         checkpoint = training.load(path)
         if not training.profile_matches(checkpoint['config'], self.a, stage, target):
             raise ValueError('profile mismatch')
-        return dict(path=str(path), iteration=checkpoint['iteration'], num_updates=checkpoint['num_updates'])
+        if checkpoint['world_size'] != len(training.gpu_ids(self.a)):
+            raise ValueError('world size mismatch')
+        return dict(path=str(path), iteration=checkpoint['iteration'], num_updates=checkpoint['num_updates'],
+                    world_size=checkpoint['world_size'])
 
     def export_curves(self):
         training.write_csv(self.out / 'training_curves.csv',
@@ -77,7 +82,8 @@ class FakeTraining(training.TrainingEvaluation):
                 policy_trainer={'batch_size': self.a.policy_batch}, wm_trainer={'batch_size': self.a.wm_batch},
                 schedule={'total_iterations': target})
             def ck(step):
-                return dict(config=config, iteration=step, num_updates=max(0, step-40)//3)
+                return dict(config=config, iteration=step, num_updates=max(0, step-40)//3,
+                            world_size=len(training.gpu_ids(self.a)))
             directory = self.out / name
             if '--resume' not in args:
                 training.save(directory / 'ckpt_0000000.pt', ck(0))
@@ -87,10 +93,13 @@ class FakeTraining(training.TrainingEvaluation):
                 training.save(directory / f'ckpt_{step:07d}.pt', ck(step))
             runtime = dict(status='failed' if name == self.fail_at else 'completed',
                 iteration=end, num_updates=ck(end)['num_updates'], process_wall_s=10, loop_s=8,
-                sampled_process_peak_gib=23.5, resume=arg('--resume') if '--resume' in args else None)
-            training.save(directory / 'runtime.json', runtime)
-            number = len(list(directory.glob('runtime_*.json')))
-            training.save(directory / f'runtime_{number}.json', runtime)
+                world_size=len(training.gpu_ids(self.a)), sampled_process_peak_gib=23.5,
+                resume=arg('--resume') if '--resume' in args else None)
+            for rank in range(len(training.gpu_ids(self.a))):
+                rank_dir = training.runtime_directory(directory, rank)
+                training.save(rank_dir / 'runtime.json', dict(runtime, rank=rank))
+                number = len(list(rank_dir.glob('runtime_*.json')))
+                training.save(rank_dir / f'runtime_{number}.json', dict(runtime, rank=rank))
             if name == self.fail_at:
                 raise RuntimeError('injected interrupted training')
         elif script.endswith('eval_benchmark.py'):
@@ -99,6 +108,11 @@ class FakeTraining(training.TrainingEvaluation):
             raise AssertionError(script)
 
     def command(self, name, command, extra_env=None):
+        if name in ('smoke', 'train'):
+            self.launches.append((name, [str(c) for c in command]))
+            index = next(i for i, item in enumerate(command) if str(item).endswith('recap_training_worker.py'))
+            self.python(name, 'scripts/recap_training_worker.py', *command[index+1:])
+            return
         self.calls.append((name, [str(c) for c in command]))
         if name != 'evaluation':
             raise AssertionError(name)
@@ -277,6 +291,73 @@ class TrainingTests(unittest.TestCase):
         self.assertIsNone(tyro.cli(namespace['main'], args=['--npz-dir', 'npz', '--manifest', 'filter.csv',
                                                         '--out', 'packed.pt', '--workers', '8']))
 
+    def test_dual_gpu_defaults_keep_paper_batch_and_separate_results(self):
+        single = training.arguments([])
+        dual = training.arguments(['--gpus', '0,1'])
+        self.assertEqual((single.policy_batch, single.vram_gb), (2048, 40))
+        self.assertEqual((dual.num_envs, dual.policy_batch, dual.wm_batch, dual.vram_gb), (4096, 4096, 2048, 72))
+        self.assertNotEqual(single.out, dual.out)
+        self.assertEqual(single.library, dual.library)
+        for invalid in ('0,0', '0,', '0,1,2'):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                training.arguments(['--gpus', invalid])
+
+    def test_dual_gpu_reuses_data_starts_fresh_and_evaluates_on_first_card(self):
+        self.assertEqual(self.run_quietly(FakeTraining(self.args('--smoke-only'))), 0)
+        old_report = (self.directory / 'out/report.md').read_bytes()
+        runner = FakeTraining(self.args('--gpus', '0,1', '--out', 'out_dual'), free_gib=80)
+        self.assertEqual(self.run_quietly(runner), 0)
+        self.assertNotIn('library', [name for name, _ in runner.calls])
+        for name, command in runner.launches:
+            self.assertIn('torch.distributed.run', command)
+            self.assertIn('--standalone', command)
+            self.assertIn('--nproc-per-node=2', command)
+            self.assertIn('--max-restarts=0', command)
+            self.assertNotIn('--resume', command)
+        evaluation = next(args for name, args in runner.calls if name == 'evaluation')
+        self.assertEqual(evaluation[evaluation.index('--gpu')+1], '0')
+        runtime = training.load(self.directory / 'out_dual/train/rank_1/runtime.json')
+        self.assertEqual((runtime['world_size'], runtime['iteration']), (2, 200))
+        summary = training.load(self.directory / 'out_dual/training_summary.json')
+        self.assertEqual(summary['profile']['total_envs'], 16)
+        self.assertAlmostEqual(summary['gpu_process_hours'], 20/3600)
+        self.assertEqual((self.directory / 'out/report.md').read_bytes(), old_report)
+
+    def test_dual_gpu_checks_second_card_before_starting(self):
+        runner = FakeTraining(self.args('--gpus', '0,1'), free_gib={'0': 80, '1': 35})
+        self.assertEqual(self.run_quietly(runner), 1)
+        self.assertFalse(runner.launches)
+        self.assertFalse(runner.calls)
+        self.assertIn('GPU 1:', training.load(self.directory / 'out/status.json')['error'])
+
+    def test_dual_gpu_interruption_resumes_checkpoint_on_both_ranks(self):
+        runner = FakeTraining(self.args('--gpus', '0,1'), fail_at='train', free_gib=80)
+        self.assertEqual(self.run_quietly(runner), 1)
+        again = FakeTraining(self.args('--gpus', '0,1'), free_gib=80)
+        self.assertEqual(self.run_quietly(again), 0)
+        self.assertEqual([name for name, _ in again.launches], ['train'])
+        self.assertIn('--resume', again.launches[0][1])
+        for rank in range(2):
+            record = training.load(training.runtime_directory(self.directory / 'out/train', rank) / 'runtime.json')
+            self.assertEqual(record['status'], 'completed')
+            self.assertTrue(record['resume'].endswith('ckpt_latest.pt'))
+
+    def test_dual_gpu_completion_requires_both_rank_records(self):
+        runner = FakeTraining(self.args('--gpus', '0,1'), free_gib=80)
+        self.assertEqual(self.run_quietly(runner), 0)
+        path = self.directory / 'out/train/rank_1/runtime.json'
+        record = training.load(path)
+        record['status'] = 'failed'
+        training.save(path, record)
+        with self.assertRaisesRegex(ValueError, 'rank 1'):
+            runner.completed_training('train', 200)
+
+    def test_gpu_aliases_cannot_select_the_same_physical_card(self):
+        runner = FakeTraining(self.args('--gpus', '0,GPU-alias'), free_gib=80)
+        with patch.object(runner, 'gpu_info', return_value=dict(uuid='same-gpu', free_gib=80)):
+            self.assertEqual(self.run_quietly(runner), 1)
+        self.assertFalse(runner.launches)
+
 
 def vars_tree(config):
     from dataclasses import asdict
@@ -284,6 +365,70 @@ def vars_tree(config):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_rank_pinning_initializes_nccl_on_cuda_zero_for_each_rank(self):
+        source = ROOT / 'src/supermimic/training/distributed.py'
+        tree = ast.parse(source.read_text(encoding='utf-8'))
+        init = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'init_distributed')
+        for rank, selected in enumerate(('3', '7')):
+            with patch.dict(os.environ, {'WORLD_SIZE': '2', 'LOCAL_WORLD_SIZE': '2', 'RANK': str(rank),
+                                        'LOCAL_RANK': str(rank)}, clear=True), \
+                 patch.object(os, 'sched_getaffinity', return_value=set(range(8)), create=True), \
+                 patch.object(os, 'sched_setaffinity', create=True) as affinity:
+                self.assertEqual(worker.pin_rank('3,7', rank), (rank, 2, selected))
+                self.assertEqual(os.environ['CUDA_VISIBLE_DEVICES'], selected)
+                self.assertEqual(os.environ['SM_GPU_PINNED'], '1')
+                affinity.assert_called_once_with(0, set(range(rank*4, (rank+1)*4)))
+                calls = []
+                cuda = types.SimpleNamespace(device_count=lambda: 1, set_device=lambda d: calls.append(('device', d)))
+                dist = types.SimpleNamespace(init_process_group=lambda *a, **kw: calls.append((a, kw)))
+                namespace = dict(os=os, torch=types.SimpleNamespace(cuda=cuda), dist=dist, is_distributed=lambda: True)
+                exec(compile(ast.Module(body=[init], type_ignores=[]), str(source), 'exec'), namespace)
+                self.assertEqual(namespace['init_distributed'](), (rank, 0, 2))
+                self.assertEqual(calls, [('device', 0), (('nccl',), {'rank': rank, 'world_size': 2})])
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, 'worker group'):
+            worker.pin_rank('0,1')
+
+    def test_worker_main_writes_separate_rank_memory_and_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for rank in range(2):
+                cuda = types.SimpleNamespace(is_available=lambda: True,
+                    get_device_properties=lambda i: types.SimpleNamespace(total_memory=80*worker.GIB),
+                    set_per_process_memory_fraction=lambda *a: None, reset_peak_memory_stats=lambda: None,
+                    **{name: lambda: 30*worker.GIB for name in ['memory_allocated', 'memory_reserved',
+                       'max_memory_allocated', 'max_memory_reserved']})
+                cfg = types.SimpleNamespace(device='cuda:0', log_root=Path(directory), run_name='smoke', resume=None)
+                class FixtureTrainer:
+                    def __init__(self, config):
+                        self.iteration, self.num_updates, self.is_main = 0, 0, rank == 0
+                        self.writer = types.SimpleNamespace(add_scalar=lambda *a: None, close=lambda: None,
+                                                            flush=lambda: None) if self.is_main else None
+                    def save(self, name):
+                        pass
+                    def run(self, on_log=None):
+                        for step in (50, 100):
+                            self.iteration, self.num_updates = step, (step-40)//3
+                            if self.writer:
+                                self.writer.add_scalar('wm/loss', .01, step)
+                            on_log(step)
+                modules = {'torch': types.SimpleNamespace(cuda=cuda),
+                           'tyro': types.SimpleNamespace(cli=lambda *a, **kw: cfg),
+                           'supermimic.config': types.SimpleNamespace(TrainConfig=object),
+                           'supermimic.training.loop': types.SimpleNamespace(Trainer=FixtureTrainer)}
+                env = dict(WORLD_SIZE='2', LOCAL_WORLD_SIZE='2', RANK=str(rank), LOCAL_RANK=str(rank))
+                with patch.dict(sys.modules, modules), patch.dict(os.environ, env, clear=True), \
+                     patch.object(os, 'sched_getaffinity', side_effect=OSError, create=True), \
+                     patch.object(worker.signal, 'signal'), \
+                     patch.object(worker.subprocess, 'run', return_value=types.SimpleNamespace(stdout=f'{os.getpid()}, 30720\n')), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    worker.main(['--gpus', '0,1', '--memory-gib', '72'])
+                rank_dir = training.runtime_directory(Path(directory) / 'smoke', rank)
+                runtime = training.load(rank_dir / 'runtime.json')
+                self.assertEqual((runtime['status'], runtime['rank'], runtime['world_size']), ('completed', rank, 2))
+                self.assertEqual(runtime['physical_gpu'], str(rank))
+                self.assertEqual(runtime['torch_allowance_gib'], 68)
+                rows = training.read_csv(rank_dir / 'memory.csv')
+                self.assertEqual([int(r['iteration']) for r in rows], [0, 50, 100, 100])
+
     def test_duplicate_nvml_rows_are_not_added_and_other_jobs_are_excluded(self):
         self.assertEqual(worker.process_memory_gib('11, 4096\n11, 4096\n12, 64000\n', 11), 4)
         self.assertIsNone(worker.process_memory_gib('12, 64000\n', 11))
@@ -317,7 +462,7 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'ckpt_latest.pt'
             path.write_bytes(b'last good checkpoint')
-            trainer = types.SimpleNamespace(is_main=True, log_dir=Path(directory), iteration=100, num_updates=24,
+            trainer = types.SimpleNamespace(is_main=True, world=1, log_dir=Path(directory), iteration=100, num_updates=24,
                 wm=model, policy=model, critic=model, wm_trainer=types.SimpleNamespace(opt=model),
                 policy_trainer=types.SimpleNamespace(opt=model, critic_opt=model),
                 command=types.SimpleNamespace(bin_return=0, bin_memory=0), cfg={})
