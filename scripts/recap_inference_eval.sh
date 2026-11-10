@@ -136,7 +136,10 @@ def parse_push(text):
 
 def arguments(argv=None):
     p = argparse.ArgumentParser(prog='recap_inference_eval.sh', description='自动评测已下载的 SuperMimic 权重；不训练。相同配置重跑可续跑。')
-    p.add_argument('--gpu', default='1', help='单张物理 GPU 的编号或 UUID（默认 1）')
+    p.add_argument('--gpu', '--gpus', dest='gpu', default='1', help='物理 GPU 编号或 UUID；双卡用 0,1')
+    p.add_argument('--vram-gb', help='每卡预算 GiB；单值广播，或按 GPU 顺序填写 40,70；各留 4 GiB 给 Warp/上下文')
+    p.add_argument('--num-envs-per-gpu', help='按 GPU 顺序指定并行环境数，例如 1024,2048；省略则各用 --num-envs')
+    p.add_argument('--reuse-from', type=Path, help='从已停止的旧测评目录导入完成的全量分片；必须使用新的 --out')
     p.add_argument('--ckpt', type=Path, default=Path('data/checkpoints/e8/e8_boneseed_ckpt_0100000.pt'))
     p.add_argument('--archive', type=Path, default=Path('data/raw/bones_seed/g1.tar.gz.part'))
     p.add_argument('--raw-dir', type=Path, default=Path('data/raw/bones_seed'))
@@ -164,9 +167,11 @@ def arguments(argv=None):
     for key in ['workers', 'num_envs', 'subset_size', 'repeats', 'shard_size']:
         if getattr(a, key) < 1:
             p.error(f'--{key.replace("_", "-")} must be positive')
-    if ',' in a.gpu:
-        p.error('--gpu accepts one GPU; this script processes shards sequentially')
-    for key in ['ckpt', 'archive', 'raw_dir', 'npz_dir', 'out', 'reference', 'manifest']:
+    devices = [g.strip() for g in a.gpu.split(',')]
+    if any(not g for g in devices) or len(set(devices)) != len(devices):
+        p.error('--gpus requires distinct nonempty GPU identifiers')
+    a.gpu = ','.join(devices)
+    for key in ['ckpt', 'archive', 'raw_dir', 'npz_dir', 'out', 'reference', 'manifest', 'reuse_from']:
         if getattr(a, key) is not None:
             setattr(a, key, getattr(a, key).resolve())
     return a
@@ -264,6 +269,8 @@ class Evaluation:
             code.update(p.read_bytes())
         cfg = {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items() if k not in {'render', 'render_only'}}
         cfg.update(checkpoint_sha256=digest(a.ckpt), code_sha256=code.hexdigest())
+        if hasattr(self, 'evaluation_code_sha256'):
+            cfg['evaluation_code_sha256'] = self.evaluation_code_sha256()
         cfg['reference_sha256'] = digest(a.reference) if a.reference and a.reference.is_file() else None
         cfg['manifest_sha256'] = digest(a.manifest) if a.manifest else None
         cfg['archive_stat'] = [a.archive.stat().st_size, a.archive.stat().st_mtime_ns] if a.archive.exists() and not a.skip_prep else None
@@ -512,6 +519,8 @@ class Evaluation:
             elapsed = self.state['stages'][stage]['elapsed_s']
             if name == 'full':
                 elapsed += sum(v.get('elapsed_s', 0) for k, v in self.state['stages'].items() if k.startswith('full_') and v['status'] == 'completed')
+                if 'full_parallel_wall_s' in self.state:
+                    elapsed = self.state['stages'][stage]['elapsed_s'] + self.state['full_parallel_wall_s']
             summary.append(dict(run=name, **stats(rows), elapsed_s=elapsed))
         fields = ['run', 'clips', 'failed', 'failure_rate', 'mean_norm_return', 'step_weighted_norm_return', 'elapsed_s']
         write_csv(self.out/'summary.csv', summary, fields)
@@ -550,7 +559,7 @@ class Evaluation:
                  '- 第三方 e8 发布记录：145/129,491，回报均值 0.932、步数加权 0.925；不是本次实测值。',
                  '- 论文图 3(a) 的回报没有该点的精确表值；本仓库按实际执行步数归一化，提前终止的惩罚口径未对齐。',
                  '- 分组规则：名称含 flip、含 side_roll/sideway、其余；groups.csv 不是论文精确分组。论文单卡翻转 1/44、侧滚 2/22 仅作参照。',
-                 '- 计时包含初始化/加载，full 为所有分片及合并耗时之和；不是训练时间、纯推理延迟或浏览器 FPS。',
+                 '- 计时包含初始化/加载；full 单卡为分片及合并耗时之和，并行模式使用墙钟时间。不是训练时间、纯推理延迟或浏览器 FPS。',
                  '- BONES 基准衡量训练动作覆盖；本次不验证训练效率、世界模型误差、未见动作泛化或真机迁移。', '',
                  '**重复性**', '', f'同一固定子集的重复运行（不是独立训练种子）：`{json.dumps(repeat, ensure_ascii=False)}`', '']
         refstage = 'reference_subset' if a.skip_full else 'reference_full'
@@ -631,7 +640,12 @@ def main(argv=None):
         sig = getattr(signal, name, None)
         if sig is not None and signal.getsignal(sig) != signal.SIG_IGN:
             signal.signal(sig, interrupted)
-    return Evaluation(arguments(argv)).run()
+    a = arguments(argv)
+    if ',' in a.gpu or a.vram_gb or a.num_envs_per_gpu or a.reuse_from:
+        sys.path.insert(0, str(Path.cwd() / 'scripts'))
+        from recap_parallel_eval import ParallelEvaluation
+        return ParallelEvaluation(a).run()
+    return Evaluation(a).run()
 
 
 if __name__ == '__main__':

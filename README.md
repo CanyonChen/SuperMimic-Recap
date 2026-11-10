@@ -74,6 +74,8 @@ uv run python scripts/data/build_library.py --help
 
 For automated BONES training, checkpoint evaluation, reports and videos, see [the training reproduction guide](docs/RECAP_TRAINING_EVAL.md). Use `bash scripts/recap_training_eval.sh --gpus 0,1` for two H100s (4096 environments and policy batch 4096 per GPU, 72 GiB budget per GPU), or `--gpu 1 --vram-gb 40` for the smaller single-GPU profile.
 
+For faster checkpoint evaluation on two GPUs, see [the inference evaluation guide](docs/RECAP_INFERENCE_EVAL.md). The evaluator supports `--gpus 0,1 --vram-gb 40,70 --num-envs-per-gpu 1024,2048 --shard-size 8192`, persistent workers, and importing completed single-GPU shards with `--reuse-from OLD --out NEW`. This changes evaluation throughput, not training.
+
 ```bash
 # LAFAN1, paper observations, one GPU
 env -u PYTHONPATH uv run sm-train --run-name lafan1 --data.npz-dir data/npz/lafan1 \

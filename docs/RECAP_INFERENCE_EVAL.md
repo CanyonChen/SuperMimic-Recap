@@ -19,6 +19,77 @@ bash scripts/recap_inference_eval.sh --gpu 1
 | `--ckpt` / `--archive` / `--npz-dir` / `--out` | 改用指定路径；相对路径按仓库根目录解释 |
 | `--help` | 查看全部配置选项 |
 
+**双 H100 并行验证：GPU 0 预算 40 GiB，GPU 1 预算 70 GiB**
+
+两张卡分别运行独立的确定性动作测评，动态领取不同分片，不需要 DDP 或梯度同步。
+每卡只启动一个常驻进程，策略只加载一次；数据目录也只列举一次。分片仍分别建立仿真环境。
+下面配置使用 1,024 / 2,048 个并行环境，每片最多 8,192 条动作；任务不足时自动降低实际环境数。
+这些参数增加吞吐量，具体 H100 加速比和峰值显存需要服务器实测。
+
+若旧的单卡验证仍在运行，先停止它；在 `tail -f` 中按 Ctrl+C 只退出日志查看。
+以下针对之前 `--gpu 0 --ckpt logs/repro_train_2xh100/train/ckpt_0152000.pt` 的启动命令，只匹配该 Python 调度进程。
+SIGTERM 会让它停止自己的评测子进程，并保存中断状态和已完成结果。
+
+```bash
+cd /home/jovyan/canyon/SuperMimic-Recap
+
+OLD_EVAL_PATTERN='^/home/jovyan/canyon/SuperMimic-Recap/\.venv/bin/python[^ ]* -u - --gpu 0 --ckpt logs/repro_train_2xh100/train/ckpt_0152000\.pt([[:space:]]|$)'
+pkill -TERM -f "$OLD_EVAL_PATTERN" || true
+while pgrep -f "$OLD_EVAL_PATTERN" >/dev/null; do
+  echo '等待旧验证退出……'
+  sleep 3
+done
+
+git pull --ff-only origin main
+```
+
+确认上面的 `git pull` 成功后，启动新验证：
+
+```bash
+nohup bash scripts/recap_inference_eval.sh \
+  --gpus 0,1 --vram-gb 40,70 \
+  --num-envs 1024 --num-envs-per-gpu 1024,2048 \
+  --ckpt logs/repro_train_2xh100/train/ckpt_0152000.pt \
+  --npz-dir data/npz/bones_seed \
+  --manifest logs/repro_train_2xh100/manifest_filtered.csv \
+  --skip-prep --subset-size 2000 --repeats 3 --shard-size 8192 \
+  --reuse-from logs/repro_train_2xh100/eval_0152000 \
+  --out logs/repro_train_2xh100/eval_0152000_dual \
+  --render \
+  > logs/recap_eval_0152000_dual_launcher.log 2>&1 < /dev/null &
+
+tail -f logs/recap_eval_0152000_dual_launcher.log
+```
+
+`--reuse-from` 校验权重、数据文件清单、过滤清单和评测实现，按动作名导入旧目录中已完成的全量分片。
+支持将原来每片 2,000 条动作重新组合到 8,192 条的新分片，缺失部分才重新计算。
+原目录保留不动，新的单动作/三轮子集/案例/扰动测试仍执行，报告注明每片 GPU、环境数和旧结果来源。
+允许复用本项目发布版本 `f6d52d5` 的原始测评，以及记录了相同核心评测指纹的新版本；代码无法核验时不会混用结果。
+原始数据目录只审计一次，不会每卡重复审计、转换或过滤。
+如果旧任务还没完成任何全量分片，会记录复用数量为 0 并执行全量测试。
+
+每张卡的 PyTorch 分配上限分别为 36 / 66 GiB，另外预留 4 GiB 给 Warp、CUDA 上下文等。
+进程总显存每 5 秒通过 `nvidia-smi` 采样，发现超预算会停止并保留已完成分片。
+这是应用预算，不是 MIG 硬隔离；容器内 PID 无法映射时，`memory/` 会明确记录总显存监测不可用。
+预算不会预先占满显存，也不代表越接近预算就越快。
+
+新目录增加：
+
+| 文件 | 内容 |
+|---|---|
+| `execution.json` | 每卡环境数/预算、并行墙钟时间、各 worker 耗时之和、复用动作数 |
+| `reuse.json` | 旧结果目录、校验信息、导入分片及其原有执行配置 |
+| `memory/*.json` | PyTorch 峰值、采样到的进程显存峰值、监测限制 |
+| `logs/worker_0.log`、`logs/worker_1.log` | 每卡的初始化和逐片动作进度 |
+| `workers/` | 每次启动的任务清单、临时结果、逐片执行与显存记录 |
+| `launcher.pid` | 当前调度进程 PID；正常退出后删除 |
+
+相同新命令重跑可续接新目录；不要对同一个输出目录同时启动两份调度器。
+需要再次停止新任务时，用 `kill -TERM "$(cat logs/repro_train_2xh100/eval_0152000_dual/launcher.pid)"`。
+`summary.csv` 的 `full` 耗时按并行墙钟时间统计，导入结果的旧耗时不计入；完整本次耗时另见 `execution.json`。
+不同 GPU/环境批量可能带来浮点数值差异，报告中的重复性结果也会包含这些执行配置的差异。
+之前 e8 测评的 `reference.json.gz` 若存在，会直接复用，无需再次下载。
+
 **输出：`logs/repro_e8_auto/`**
 
 | 文件或目录 | 内容 |
@@ -54,4 +125,5 @@ CPU 流程测试（使用模拟评测输出，不验证 GPU 推理或实际视�
 
 ```bash
 python -m unittest discover -s tests -p test_recap_inference_eval.py -v
+python -m unittest discover -s tests -p test_recap_parallel_eval.py -v
 ```
